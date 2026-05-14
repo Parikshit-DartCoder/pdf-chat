@@ -1,0 +1,230 @@
+name: rag_exp
+
+# Shared env block reused by api + app. YAML anchor; top-level x-* per compose spec.
+x-app-env: &app_env
+  OLLAMA_BASE_URL: http://ollama:11434
+  QDRANT_URL: http://qdrant:6333
+  LANGFUSE_HOST: http://langfuse:3000
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-rag-exp-local}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-rag-exp-local}
+  LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+  PADDLEOCR_VL_URL: http://paddleocr-vl:8118/v1
+  PADDLEOCR_VL_MODEL: PaddleOCR-VL-1.5-0.9B
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  ollama:
+    image: ollama/ollama:0.4.7
+    restart: unless-stopped
+    ports:
+      - "11435:11434"   # host:container — host's own Ollama owns 11434
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      # Per-service GPU index. Defaults to 0 (single-GPU friendly). On a
+      # multi-GPU host, set OLLAMA_GPU / PADDLEOCR_GPU / APP_GPU in .env.
+      NVIDIA_VISIBLE_DEVICES: "${OLLAMA_GPU:-0}"
+      CUDA_VISIBLE_DEVICES: "0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${OLLAMA_GPU:-0}"]
+              capabilities: [gpu]
+
+  # Baidu's official PaddleOCR-VL + vLLM image. Bundles a known-good vLLM
+  # version with the model code; exposes an OpenAI-compatible API at /v1.
+  # Per https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/PaddleOCR-VL.html
+  #
+  # Alternative (stock vLLM, no Baidu registry):
+  #   image: vllm/vllm-openai:v0.11.1   # or newer
+  #   ports: ["8000:8000"]
+  #   command:
+  #     - "--model"
+  #     - "PaddlePaddle/PaddleOCR-VL"
+  #     - "--trust-remote-code"
+  #     - "--max-num-batched-tokens"
+  #     - "16384"
+  #     - "--no-enable-prefix-caching"
+  #     - "--mm-processor-cache-gb"
+  #     - "0"
+  #     - "--gpu-memory-utilization"
+  #     - "0.35"
+  #     - "--served-model-name"
+  #     - "PaddleOCR-VL-0.9B"
+  #   Then on the `app` service set:
+  #     PADDLEOCR_VL_URL: http://paddleocr-vl:8000/v1
+  #     PADDLEOCR_VL_MODEL: PaddleOCR-VL-0.9B
+  # Until vLLM 0.11.1 is on Docker Hub, use the `vllm/vllm-openai:nightly` tag.
+  paddleocr-vl:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu
+    restart: unless-stopped
+    ipc: host
+    ports:
+      - "8118:8118"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - paddle_cache:/root/.paddlex
+    command:
+      - "paddleocr"
+      - "genai_server"
+      - "--model_name"
+      - "PaddleOCR-VL-1.5-0.9B"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8118"
+      - "--backend"
+      - "vllm"
+      - "--backend_config"
+      - "gpu-memory-utilization: 0.6"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${PADDLEOCR_GPU:-0}"
+      CUDA_VISIBLE_DEVICES: "0"   # always index 0 inside the container
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${PADDLEOCR_GPU:-0}"]
+              capabilities: [gpu]
+
+  ollama-bootstrap:
+    image: ollama/ollama:0.4.7
+    depends_on:
+      - ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "until ollama list >/dev/null 2>&1; do sleep 2; done;
+       ollama pull qwen2.5:7b-instruct &&
+       ollama pull bge-m3"
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  langfuse:
+    image: langfuse/langfuse:2
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@postgres:5432/langfuse
+      NEXTAUTH_SECRET: change-me-in-production-please
+      SALT: change-me-too
+      NEXTAUTH_URL: http://localhost:3000
+      TELEMETRY_ENABLED: "false"
+      # Init-on-first-boot bootstrap. These env vars are honored ONLY when the
+      # Langfuse postgres volume is empty. If you've already booted Langfuse,
+      # run `docker compose down -v` (wipes data) or create keys via the UI.
+      LANGFUSE_INIT_ORG_ID: rag-exp
+      LANGFUSE_INIT_ORG_NAME: rag-exp
+      LANGFUSE_INIT_PROJECT_ID: rag-exp
+      LANGFUSE_INIT_PROJECT_NAME: rag-exp
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-rag-exp-local}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-rag-exp-local}
+      LANGFUSE_INIT_USER_EMAIL: admin@rag-exp.local
+      LANGFUSE_INIT_USER_NAME: Admin
+      LANGFUSE_INIT_USER_PASSWORD: changeme123
+    ports:
+      - "3000:3000"
+
+  # FastAPI backend. The agent and ingestion live here; Streamlit + OpenWebUI
+  # are pure HTTP clients.
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    depends_on:
+      - qdrant
+      - ollama
+      - langfuse
+      - paddleocr-vl
+    environment:
+      <<: *app_env
+      NVIDIA_VISIBLE_DEVICES: "${APP_GPU:-0}"
+      CUDA_VISIBLE_DEVICES: "0"
+    command: ["uvicorn", "rag_exp.app.api:app", "--host", "0.0.0.0", "--port", "8000",
+              "--app-dir", "/app/src"]
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./data:/app/data
+      - ./prompts:/app/prompts
+      - ./configs:/app/configs
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${APP_GPU:-0}"]
+              capabilities: [gpu]
+
+  # Streamlit UI. Talks to api over HTTP — no in-process imports.
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    depends_on:
+      - api
+    environment:
+      <<: *app_env
+      RAG_API_URL: http://api:8000
+    command: ["streamlit", "run", "/app/src/rag_exp/app/streamlit_app.py",
+              "--server.address=0.0.0.0", "--server.port=8501",
+              "--server.maxUploadSize=1024"]
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./data:/app/data
+      - ./prompts:/app/prompts
+      - ./configs:/app/configs
+    ports:
+      - "8501:8501"
+
+  # OpenWebUI as an alternative frontend. Talks to api via the OpenAI-compatible
+  # shim at /v1/chat/completions. Demoable side-by-side with Streamlit.
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    depends_on:
+      - api
+    environment:
+      OPENAI_API_BASE_URL: http://api:8000/v1
+      OPENAI_API_KEY: rag-exp-local
+      WEBUI_AUTH: "False"
+      ENABLE_OLLAMA_API: "False"
+    volumes:
+      - openwebui_data:/app/backend/data
+    ports:
+      - "3001:8080"
+
+volumes:
+  qdrant_data:
+  ollama_data:
+  postgres_data:
+  hf_cache:
+  paddle_cache:
+  openwebui_data:

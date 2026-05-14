@@ -1,0 +1,40 @@
+# Retrieval, re-ranking, and ingestion hyperparameters.
+#
+# This file is the source of truth for tunable knobs. settings.py loads it at
+# startup. Any env var override (e.g. TOP_K=15 docker compose exec ...) wins
+# over the value here, so one-off experiments stay convenient.
+#
+# Precedence: env var > this file > built-in default in settings.py.
+
+[retrieval]
+# Final candidate count fed to the reranker after RRF fusion.
+top_k = 30
+# Chunks attached to the answer prompt after reranking.
+rerank_top_n = 7
+# Master switch for BM25 + dense + RRF. Set false to revert to dense-only.
+hybrid_enabled = true
+# Per-vector prefetch sizes before RRF fusion. Bigger = better recall, slower.
+dense_prefetch_k = 60
+sparse_prefetch_k = 60
+# Normalised cross-encoder score (0-1). Chunks below this are dropped after
+# rerank. 0.10 is permissive; 0.30+ is strict.
+rerank_score_floor = 0.10
+# Safety net: if fewer than this many chunks clear the floor (typical for
+# vague queries like "what is this doc about"), return the top-scored chunks
+# anyway so the answerer has something to work with.
+rerank_min_chunks = 3
+# Task instruction passed to bge-reranker-v2-m3. Free quality lift.
+rerank_instruction = "Given a question, retrieve passages that contain the answer."
+
+[chunking]
+chunk_size = 1200
+chunk_overlap = 150
+
+[ingestion]
+# Vectors per Ollama embedding HTTP request. Bigger = fewer round-trips.
+embed_batch = 256
+# Pages with less embedded text than this trigger PaddleOCR-VL OCR.
+# Set very high (999999) to force OCR everywhere.
+ocr_min_chars_per_page = 40
+# Concurrent OCR requests against PaddleOCR-VL.
+ocr_max_concurrency = 8
