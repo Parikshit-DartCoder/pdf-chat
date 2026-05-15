@@ -105,7 +105,7 @@ def main() -> None:
             for svc, ok in _get_health().items():
                 st.markdown(f"- **{svc}**: {'up' if ok else 'down'}")
 
-        if st.button("New conversation", use_container_width=True):
+        if st.button("New session (resets document scope)", use_container_width=True):
             try:
                 with _http() as c:
                     st.session_state.session_id = c.post("/v1/sessions").json()["session_id"]
@@ -113,6 +113,10 @@ def main() -> None:
                 st.session_state.session_id = str(uuid.uuid4())
             st.session_state.history = []
             st.rerun()
+        st.caption(
+            "A session groups documents. Every PDF you ingest in this session "
+            "is searched together; starting a new session clears that scope."
+        )
 
         st.divider()
         st.subheader("Add PDFs")
@@ -135,12 +139,20 @@ def main() -> None:
 
         session_docs = _get_session_documents(st.session_state.session_id)
         if session_docs:
-            with st.expander(f"Active in this session ({len(session_docs)})", expanded=True):
+            with st.expander(f"Searched in this session ({len(session_docs)})", expanded=True):
                 for d in session_docs:
                     st.caption(d["display_name"])
-                st.caption("Retrieval is scoped to these documents.")
+                st.caption(
+                    "Answers are scoped to ALL of these documents. Add more and "
+                    "they join the same scope; start a new session to reset."
+                )
         else:
-            st.caption("No session-scoped documents yet. Retrieval will search the full corpus.")
+            st.warning(
+                "No documents in this session yet — questions will search the "
+                "ENTIRE corpus (every file ever ingested, including other "
+                "sessions and CLI bulk loads). Upload a PDF to scope answers "
+                "to just your documents."
+            )
 
         with st.expander("Full corpus index"):
             corpus = _get_corpus()

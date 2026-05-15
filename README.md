@@ -227,6 +227,17 @@ sudo docker compose exec api rag-ingest
 
 Idempotent in both routes: chunk IDs are content-hashed (UUID5), so re-uploading or re-running upserts in place.
 
+### Session scoping (which documents a question searches)
+
+All chunks live in **one shared Qdrant collection**, but retrieval is scoped per session:
+
+- Every PDF uploaded **in a session** is registered to that `session_id` (SQLite `SessionDocument`).
+- When a session has registered documents, retrieval is **hard-filtered to exactly those documents** (Qdrant `source_path` filter) — every document in the session is searched together, and nothing else.
+- When a session has **no** registered documents (fresh session, or chat-only without upload), retrieval **falls back to the entire corpus** — every file ever ingested, including other sessions and CLI bulk loads. This is why "old files also get queried" in a doc-less session.
+- **Start a new session to reset scope.** In Streamlit, the **"New session (resets document scope)"** button issues a fresh `session_id` (via `POST /v1/sessions`); subsequent uploads form a new, isolated scope. The sidebar shows exactly which documents the current session searches, and warns when a session is unscoped.
+
+To scope answers to just your documents: start a session, upload your PDFs, then ask. To search everything on purpose: ask without uploading.
+
 ## Retrieval pipeline
 
 Each user turn runs four steps inside the agent:
