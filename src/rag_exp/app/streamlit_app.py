@@ -92,7 +92,7 @@ def _render_citations(citations: list[dict]) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="📚", layout="wide")
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
     _init_session_state()
 
     with st.sidebar:
@@ -103,7 +103,7 @@ def main() -> None:
 
         with st.expander("Service health"):
             for svc, ok in _get_health().items():
-                st.markdown(f"{'✅' if ok else '❌'} {svc}")
+                st.markdown(f"- **{svc}**: {'up' if ok else 'down'}")
 
         if st.button("New conversation", use_container_width=True):
             try:
@@ -127,7 +127,7 @@ def main() -> None:
                 try:
                     results = _post_ingest(uploaded, st.session_state.session_id)
                     for r in results:
-                        st.write(f"✓ {r['name']} — {r['pages']} pages, {r['chunks']} chunks")
+                        st.write(f"- {r['name']}: {r['pages']} pages, {r['chunks']} chunks")
                     status.update(label="Done", state="complete")
                 except Exception as e:
                     status.update(label="Ingestion failed", state="error")

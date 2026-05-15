@@ -41,7 +41,7 @@ def main() -> None:
         print(f"[preload] {name}", flush=True)
         try:
             fn()
-            print(f"[preload] {name} ✓", flush=True)
+            print(f"[preload] {name} done", flush=True)
         except Exception as e:
             _warn(name, e)
 

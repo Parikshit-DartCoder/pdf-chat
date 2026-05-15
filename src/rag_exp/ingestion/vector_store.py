@@ -90,10 +90,14 @@ def ensure_collection() -> QdrantClient:
 
 
 def _chunk_id(chunk: Chunk) -> str:
-    # Qdrant point IDs must be an unsigned int or a UUID string. A name-based
-    # UUID5 gives us both determinism (same content yields the same id, so
-    # upsert is idempotent) and a Qdrant-valid format.
-    raw = f"{chunk.source_path}|{chunk.page_number}|{chunk.chunk_index}|{chunk.text[:64]}"
+    # Qdrant point IDs must be an unsigned int or a UUID string. UUID5 over
+    # normalized (source, text) ONLY -- deliberately excluding page_number /
+    # chunk_index. Repeated boilerplate (running headers, per-page credit
+    # lines from OCR'd books) otherwise produced one point per page: a single
+    # footer appeared 125x, crowding retrieval and flat-lining rerank scores.
+    # Same text in the same doc now collapses to one representative point.
+    norm = " ".join((chunk.text or "").split()).lower()
+    raw = f"{chunk.source_path}|{norm}"
     return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
 
 
