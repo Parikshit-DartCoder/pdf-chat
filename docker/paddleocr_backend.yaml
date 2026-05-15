@@ -1,0 +1,11 @@
+# vLLM backend config for PaddleOCR-VL genai_server.
+#
+# PaddleX's `genai_server` expects `--backend_config` to be a PATH to this
+# YAML file (it does `yaml.safe_load(open(path))`), NOT an inline string.
+# Each key here is turned into a `--<key>` vLLM CLI arg (underscores become
+# dashes), so `gpu_memory_utilization` -> `--gpu-memory-utilization`.
+#
+# 0.6 keeps OCR comfortably co-resident with the LLM/embedding models when
+# PADDLEOCR_GPU points at a shared GPU. Raise toward 0.9 if it has a
+# dedicated card and you ingest large scanned PDFs.
+gpu_memory_utilization: 0.6

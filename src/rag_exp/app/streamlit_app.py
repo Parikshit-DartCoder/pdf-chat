@@ -5,9 +5,11 @@ No in-process imports of `rag_exp.agent`, `rag_exp.ingestion`, or
 """
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from pathlib import Path
+from typing import Iterator
 
 import httpx
 import streamlit as st
@@ -32,14 +34,56 @@ def _init_session_state() -> None:
             st.session_state.session_id = str(uuid.uuid4())
     if "history" not in st.session_state:
         st.session_state.history = []
+    if "ingesting" not in st.session_state:
+        st.session_state.ingesting = False
 
 
-def _post_ingest(files, session_id: str) -> list[dict]:
+_STAGE_TEXT = {
+    "saved": "Upload received",
+    "pypdf": "Extracting embedded text",
+    "docling": "Layout-aware extraction (Docling)",
+    "rasterize": "Rendering scanned pages for OCR",
+    "ocr": "OCR (PaddleOCR-VL)",
+    "parsed": "Parsing complete",
+    "chunking": "Chunking",
+    "indexing": "Embedding + indexing",
+}
+
+
+def _stage_label(data: dict) -> str:
+    stage = data.get("stage", "")
+    base = _STAGE_TEXT.get(stage, stage)
+    if stage == "ocr" and "total" in data:
+        return f"{base} — page {data.get('done', 0)}/{data['total']}"
+    if stage in ("chunking", "indexing") and data.get("total") is not None:
+        unit = "pages" if stage == "chunking" else "chunks"
+        return f"{base} — {data['total']} {unit}"
+    return base
+
+
+def _stream_ingest(files, session_id: str) -> Iterator[tuple[str, dict]]:
+    """Yield (event, data) tuples from the streaming ingest endpoint so the UI
+    can render each stage live and keep chat locked until `done`."""
     payload_files = [("files", (f.name, f.getvalue(), "application/pdf")) for f in files]
     with httpx.Client(base_url=API_URL, timeout=INGEST_TIMEOUT_S) as c:
-        r = c.post("/v1/ingest", data={"session_id": session_id}, files=payload_files)
-        r.raise_for_status()
-        return r.json()["files"]
+        with c.stream(
+            "POST", "/v1/ingest/stream",
+            data={"session_id": session_id}, files=payload_files,
+        ) as r:
+            r.raise_for_status()
+            event = "message"
+            for line in r.iter_lines():
+                if not line:
+                    event = "message"
+                    continue
+                if line.startswith("event:"):
+                    event = line[len("event:"):].strip()
+                elif line.startswith("data:"):
+                    raw = line[len("data:"):].strip()
+                    try:
+                        yield event, json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
 
 
 def _post_chat(session_id: str, question: str) -> dict:
@@ -126,16 +170,44 @@ def main() -> None:
             accept_multiple_files=True,
             label_visibility="collapsed",
         )
-        if uploaded and st.button("Ingest uploaded", type="primary", use_container_width=True):
-            with st.status("Ingesting", expanded=True) as status:
+        ingest_clicked = st.button(
+            "Ingest uploaded",
+            type="primary",
+            use_container_width=True,
+            disabled=not uploaded or st.session_state.ingesting,
+        )
+        if uploaded and ingest_clicked:
+            st.session_state.ingesting = True
+            with st.status("Indexing — chat is locked until this finishes",
+                           expanded=True) as status:
                 try:
-                    results = _post_ingest(uploaded, st.session_state.session_id)
-                    for r in results:
-                        st.write(f"- {r['name']}: {r['pages']} pages, {r['chunks']} chunks")
-                    status.update(label="Done", state="complete")
+                    last_stage = None
+                    for event, data in _stream_ingest(
+                        uploaded, st.session_state.session_id
+                    ):
+                        if event == "stage":
+                            label = _stage_label(data)
+                            # Collapse repeated OCR ticks into one updating line.
+                            if data.get("stage") == "ocr":
+                                status.update(label=f"{data['file']}: {label}")
+                            elif label != last_stage:
+                                st.write(f"- {data['file']}: {label}")
+                                last_stage = label
+                        elif event == "file":
+                            st.write(
+                                f"**{data['name']}** indexed: "
+                                f"{data['pages']} pages, {data['chunks']} chunks"
+                            )
+                        elif event == "error":
+                            raise RuntimeError(data.get("message", "ingestion failed"))
+                    status.update(label="Indexing complete — chat unlocked",
+                                  state="complete")
                 except Exception as e:
                     status.update(label="Ingestion failed", state="error")
                     st.exception(e)
+                finally:
+                    st.session_state.ingesting = False
+            st.rerun()
 
         session_docs = _get_session_documents(st.session_state.session_id)
         if session_docs:
@@ -170,7 +242,16 @@ def main() -> None:
             if turn["role"] == "assistant":
                 _render_citations(turn.get("citations", []))
 
-    user_input = st.chat_input("Ask a question about the indexed PDFs")
+    if st.session_state.ingesting:
+        st.info("Indexing in progress — chat is locked until all documents "
+                "are parsed, embedded and indexed.")
+
+    user_input = st.chat_input(
+        "Indexing — please wait"
+        if st.session_state.ingesting
+        else "Ask a question about the indexed PDFs",
+        disabled=st.session_state.ingesting,
+    )
     if not user_input:
         return
 

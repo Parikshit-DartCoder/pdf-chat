@@ -255,6 +255,84 @@ async def ingest(
     return IngestOut(session_id=session_id, files=out)
 
 
+@app.post("/v1/ingest/stream")
+async def ingest_stream(
+    session_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    """Same work as POST /v1/ingest, but emits Server-Sent Events so the UI can
+    show live stages (parse / OCR per page / chunk / index) and keep the chat
+    locked until the final `done` event.
+
+    Events (all `data` is JSON):
+      stage   {"file","stage","detail"?,"done"?,"total"?}
+      file    {"name","pages","chunks"}     -- one file finished
+      done    {"files":[...]}               -- everything indexed
+      error   {"message"}
+    """
+    s = get_settings()
+    pdf_dir = Path(s.pdf_input_dir)
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    mem.init_memory()
+
+    # Read uploads now (UploadFile is bound to the request lifecycle).
+    saved: list[tuple[str, Path]] = []
+    for f in files:
+        dest = pdf_dir / f.filename
+        dest.write_bytes(await f.read())
+        saved.append((f.filename, dest))
+
+    import queue as _queue
+
+    events: _queue.Queue = _queue.Queue()
+    _SENTINEL = object()
+
+    def _worker() -> None:
+        try:
+            done_files: list[dict] = []
+            for name, dest in saved:
+                events.put({"event": "stage", "data": {"file": name, "stage": "saved"}})
+
+                def _on_progress(ev: dict, _name: str = name) -> None:
+                    events.put({"event": "stage", "data": {"file": _name, **ev}})
+
+                pages = parse_pdf(dest, progress=_on_progress)
+                events.put({"event": "stage", "data": {
+                    "file": name, "stage": "chunking", "total": len(pages)}})
+                chunks = chunk_pages(
+                    pages, chunk_size=s.chunk_size, chunk_overlap=s.chunk_overlap
+                )
+                events.put({"event": "stage", "data": {
+                    "file": name, "stage": "indexing", "total": len(chunks)}})
+                written = upsert_chunks(chunks)
+                mem.add_session_document(session_id, str(dest), name)
+                rec = {"name": name, "pages": len(pages), "chunks": written}
+                done_files.append(rec)
+                events.put({"event": "file", "data": rec})
+            events.put({"event": "done", "data": {"files": done_files}})
+        except Exception as e:  # surface, don't swallow
+            events.put({"event": "error", "data": {"message": str(e)}})
+        finally:
+            events.put(_SENTINEL)
+
+    async def _gen():
+        task = asyncio.create_task(asyncio.to_thread(_worker))
+        try:
+            while True:
+                try:
+                    item = events.get_nowait()
+                except _queue.Empty:
+                    await asyncio.sleep(0.25)
+                    continue
+                if item is _SENTINEL:
+                    break
+                yield {"event": item["event"], "data": json.dumps(item["data"])}
+        finally:
+            await task
+
+    return EventSourceResponse(_gen())
+
+
 # ---------------------------------------------------------------------------
 # OpenAI-compatible shim (for OpenWebUI and other off-the-shelf clients)
 # ---------------------------------------------------------------------------

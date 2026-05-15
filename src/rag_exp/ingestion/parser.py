@@ -13,9 +13,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from ..config.settings import get_settings
+
+
+# Optional progress sink. Called with small JSON-able dicts describing the
+# current stage, e.g. {"stage": "ocr", "done": 3, "total": 40}. Defaults to
+# None everywhere so existing callers are completely unaffected.
+ProgressCb = Callable[[dict], None] | None
+
+
+def _emit(progress: ProgressCb, **event) -> None:
+    if progress is not None:
+        try:
+            progress(event)
+        except Exception:
+            pass  # progress reporting must never break ingestion
 
 
 @dataclass
@@ -88,6 +102,37 @@ def _parse_with_pypdf(pdf_path: Path) -> list[ParsedPage]:
     return out
 
 
+def _norm_line(s: str) -> str:
+    return " ".join(s.split()).lower()
+
+
+def _repeated_boilerplate(pages: dict[int, "ParsedPage"], min_pages: int = 3) -> set[str]:
+    """Normalized text lines that appear on a majority of pages -- i.e. a
+    per-page stamp (running header, courtesy footer, watermark) baked into
+    the text layer of a scanned book. These must NOT count toward the
+    "this page already has enough text" decision, otherwise a 1-line footer
+    masks an entire page of un-extracted image content."""
+    n = len(pages)
+    if n < min_pages:
+        return set()
+    from collections import Counter
+
+    seen: Counter[str] = Counter()
+    for pg in pages.values():
+        for ln in {_norm_line(x) for x in pg.text.splitlines() if x.strip()}:
+            seen[ln] += 1
+    threshold = max(min_pages, int(0.5 * n))
+    return {ln for ln, c in seen.items() if c >= threshold}
+
+
+def _residual_len(text: str, boilerplate: set[str]) -> int:
+    """Char count of a page's text after dropping repeated-stamp lines."""
+    if not boilerplate:
+        return len(text.strip())
+    kept = [ln for ln in text.splitlines() if _norm_line(ln) not in boilerplate]
+    return len(" ".join(kept).strip())
+
+
 def _pdf_page_count(pdf_path: Path) -> int:
     import pypdfium2 as pdfium
 
@@ -98,7 +143,12 @@ def _pdf_page_count(pdf_path: Path) -> int:
         pdf.close()
 
 
-def _ocr_pages_parallel(pdf_path: Path, page_numbers: list[int], max_workers: int) -> dict[int, ParsedPage]:
+def _ocr_pages_parallel(
+    pdf_path: Path,
+    page_numbers: list[int],
+    max_workers: int,
+    progress: ProgressCb = None,
+) -> dict[int, ParsedPage]:
     """OCR multiple pages, fast AND safe.
 
     pypdfium2 is NOT thread-safe -- opening PdfDocument from worker threads
@@ -115,6 +165,7 @@ def _ocr_pages_parallel(pdf_path: Path, page_numbers: list[int], max_workers: in
     from .paddleocr_vl_client import ocr_page, rasterize_pdf_page
 
     # Phase 1: single-threaded rasterization.
+    _emit(progress, stage="rasterize", total=len(page_numbers))
     rasterized: dict[int, bytes] = {}
     for pn in page_numbers:
         try:
@@ -137,9 +188,12 @@ def _ocr_pages_parallel(pdf_path: Path, page_numbers: list[int], max_workers: in
             extractor="paddleocr-vl",
         )
 
+    total = len(rasterized)
+    _emit(progress, stage="ocr", done=0, total=total)
     results: dict[int, ParsedPage] = {}
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
         futures = {pool.submit(_ocr, pn, png): pn for pn, png in rasterized.items()}
+        done = 0
         for fut in as_completed(futures):
             page = None
             try:
@@ -148,6 +202,8 @@ def _ocr_pages_parallel(pdf_path: Path, page_numbers: list[int], max_workers: in
                 page = None
             if page is not None:
                 results[page.page_number] = page
+            done += 1
+            _emit(progress, stage="ocr", done=done, total=total)
     return results
 
 
@@ -155,7 +211,7 @@ def _ocr_pages_parallel(pdf_path: Path, page_numbers: list[int], max_workers: in
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def parse_pdf(pdf_path: Path) -> list[ParsedPage]:
+def parse_pdf(pdf_path: Path, progress: ProgressCb = None) -> list[ParsedPage]:
     """Parse a PDF page-by-page using the cheapest extractor that produces
     enough text per page.
 
@@ -174,6 +230,7 @@ def parse_pdf(pdf_path: Path) -> list[ParsedPage]:
     min_chars = s.ocr_min_chars_per_page
 
     # Phase 1: cheap pypdf pass.
+    _emit(progress, stage="pypdf", pages=page_count)
     pypdf_pages = _parse_with_pypdf(pdf_path)
     by_page: dict[int, ParsedPage] = {p.page_number: p for p in pypdf_pages}
 
@@ -181,6 +238,7 @@ def parse_pdf(pdf_path: Path) -> list[ParsedPage]:
     # extraction. Tables, multi-column, etc.
     pypdf_chars = sum(len(p.text) for p in pypdf_pages)
     if pypdf_chars < min_chars * max(1, page_count):
+        _emit(progress, stage="docling", pages=page_count)
         try:
             docling_pages = _parse_with_docling(pdf_path)
         except Exception:
@@ -191,16 +249,26 @@ def parse_pdf(pdf_path: Path) -> list[ParsedPage]:
             if existing is None or len(dp.text) > len(existing.text):
                 by_page[dp.page_number] = dp
 
-    # Phase 3: OCR any page still below the threshold. Pages are OCR'd in
-    # parallel against the PaddleOCR-VL HTTP endpoint.
+    # Phase 3: OCR any page whose REAL text is below the threshold. "Real"
+    # means after stripping repeated per-page stamps -- a scanned book often
+    # carries a 1-line courtesy footer in its text layer on every page, which
+    # would otherwise clear the char threshold and suppress OCR of the entire
+    # (image-only) body. See _repeated_boilerplate.
+    boiler = _repeated_boilerplate(by_page)
     pages_needing_ocr = [
         pn for pn in range(1, page_count + 1)
-        if (by_page.get(pn) is None or len(by_page[pn].text) < min_chars)
+        if (
+            by_page.get(pn) is None
+            or _residual_len(by_page[pn].text, boiler) < min_chars
+        )
     ]
     if pages_needing_ocr:
-        ocr_results = _ocr_pages_parallel(pdf_path, pages_needing_ocr, s.ocr_max_concurrency)
+        ocr_results = _ocr_pages_parallel(
+            pdf_path, pages_needing_ocr, s.ocr_max_concurrency, progress=progress
+        )
         by_page.update(ocr_results)
 
+    _emit(progress, stage="parsed", pages=len(by_page))
     return [by_page[k] for k in sorted(by_page)]
 
 

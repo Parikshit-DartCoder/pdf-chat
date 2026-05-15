@@ -9,7 +9,7 @@ The Python package is `rag_exp` (internal); the product is **PDF Chat**.
 | Concern | Choice | Why |
 | --- | --- | --- |
 | PDF text and layout | **Docling** (OCR disabled, pypdf fallback) | Fast layout and table-aware extraction for text-native PDFs. |
-| OCR | **PaddleOCR-VL-1.5** served by **vLLM** | 0.9B VL OCR model. Strong on Arabic incl. diacritics and ligatures. GPU-batched, OpenAI-compatible API. Replaced EasyOCR. |
+| OCR | **PaddleOCR-VL-1.5** served by **vLLM** | 0.9B VL OCR model. Strong on Arabic incl. diacritics and ligatures. GPU-batched, OpenAI-compatible API. Replaced EasyOCR. OCR trigger is boilerplate-aware: a repeated per-page footer in a scanned book's text layer no longer suppresses OCR of the image body. |
 | Chunking | Boilerplate-stripped + semantic (Article/clause) + recursive char fallback, EN+AR | Removes PDF page furniture (headers, page numbers, rule lines) and splits on Article/clause boundaries so each chunk is topically tight. Lifted context precision from a 0.47 ceiling to 0.60. |
 | Embeddings | **BGE-M3** via Ollama (1024-dim) | Strong multilingual model, covers EN and AR with a single index. |
 | Vector DB | **Qdrant** | One container, server-side BM25 sparse vectors (IDF modifier), payload indexes. |
@@ -81,7 +81,8 @@ The FastAPI backend lives at `http://localhost:8000` (or `http://api:8000` insid
 | `POST` | `/v1/sessions` | Create a new conversation session | `{}` | `{"session_id": "<uuid>"}` |
 | `POST` | `/v1/chat` | Synchronous chat turn | `{"session_id","question"}` | `{"answer","citations":[…],"route"}` |
 | `POST` | `/v1/chat/stream` | Same as above, SSE | same | events: `delta`, `done` |
-| `POST` | `/v1/ingest` | Upload + ingest PDFs | multipart: `session_id`, `files[]` | `{"session_id","files":[{name,pages,chunks}]}` |
+| `POST` | `/v1/ingest` | Upload + ingest PDFs (blocking) | multipart: `session_id`, `files[]` | `{"session_id","files":[{name,pages,chunks}]}` |
+| `POST` | `/v1/ingest/stream` | Same, SSE with live stages | same | events: `stage` (`saved`/`pypdf`/`docling`/`rasterize`/`ocr` `done`/`total`/`chunking`/`indexing`), `file`, `done`, `error` |
 | `GET`  | `/v1/sessions/{id}/documents` | Session-scoped docs | — | `[{source_path, display_name}]` |
 | `GET`  | `/v1/corpus` | All indexed docs | — | `{"documents":[paths]}` |
 | `POST` | `/v1/chat/completions` | **OpenAI-compatible** shim used by OpenWebUI | `{model, messages, stream, user}` | OpenAI chat-completion or SSE chunks |
@@ -209,7 +210,7 @@ sudo docker compose exec api python -c "import torch; print(torch.cuda.is_availa
 ## Ingesting PDFs
 
 **Option A: upload from a UI (Streamlit or OpenWebUI).**
-- Streamlit (http://localhost:8501): sidebar -> **Upload PDFs (EN/AR)** -> **Ingest uploaded**. Posts to `POST /v1/ingest`.
+- Streamlit (http://localhost:8501): sidebar -> **Upload PDFs (EN/AR)** -> **Ingest uploaded**. Streams `POST /v1/ingest/stream`: each stage (extract -> OCR page N/total -> chunk -> index) appears live in the status panel, and the **chat input is disabled until indexing completes** (greyed out with an "Indexing — please wait" banner) so questions can't run against a half-built index.
 - OpenWebUI (http://localhost:3001): chat-side document upload also routes through the API.
 
 **Option B: REST call.**
@@ -292,7 +293,7 @@ The collection schema went from a single anonymous dense vector to a named `{den
 Each PDF page is parsed in phases:
 
 1. **pypdf** fast text pass; **Docling** runs only when pypdf is sparse (layout/table-aware).
-2. **PaddleOCR-VL** per page when text is still under `OCR_MIN_CHARS_PER_PAGE` (default 40). Pages are rasterized via pypdfium2 at 200 DPI **single-threaded** (pypdfium2 is not thread-safe — concurrent access corrupts its global state and breaks later PDFs), then OCR'd **concurrently** over the in-memory PNGs (the HTTP call is the slow, thread-safe part).
+2. **PaddleOCR-VL** per page when the page's *real* text is still under `OCR_MIN_CHARS_PER_PAGE` (default 40). "Real" text excludes **repeated per-page boilerplate**: lines present on at least half the pages (running headers, courtesy footers, watermarks baked into the text layer of a scanned book) are detected and subtracted before the threshold test. Without this, a scanned book carrying a one-line embedded footer on every page cleared the 40-char gate, OCR was skipped for the entire image-only body, and only the footer got indexed. Pages are rasterized via pypdfium2 at 200 DPI **single-threaded** (pypdfium2 is not thread-safe — concurrent access corrupts its global state and breaks later PDFs), then OCR'd **concurrently** over the in-memory PNGs (the HTTP call is the slow, thread-safe part).
 3. **Resilient embedding**: degenerate chunks (empty / whitespace / non-text) are dropped before embedding, and a batch that makes Ollama emit `NaN` falls back to per-chunk embedding so one bad page can't skip a whole document.
 
 Text-native PDFs cost no GPU OCR cycles. Scanned PDFs get a state-of-the-art Arabic-capable VL OCR. Force OCR everywhere with `OCR_MIN_CHARS_PER_PAGE=999999`.
@@ -426,7 +427,7 @@ APP_GPU=2
 
 ## Known limitations and next steps
 
-- **Handwriting and complex graphics are not reliably extracted, and this is not detected at ingest.** PaddleOCR-VL is a print/document OCR model. On handwritten classroom notes, dense diagrams, or figure-heavy pages it does not fail cleanly — it returns plausible-looking but inaccurate text. The ingest gate is purely quantitative (`len(text) >= OCR_MIN_CHARS_PER_PAGE`), so a garbled handwritten page passes the threshold, gets embedded, and silently degrades retrieval for that document. There is currently **no OCR-quality/confidence signal** surfaced to the user on load. Mitigations (not yet implemented): a per-page confidence gate combining a VL self-report (`[[UNREADABLE]]` sentinel) with a heuristic textiness score, an `ocr_confidence` payload field, default exclusion of low-confidence pages, and an explicit `rag-ingest` summary line (e.g. "4 pages flagged handwritten/unreadable and excluded"). Truly reading handwriting would require a handwriting-specialised model or a larger VLM — out of scope for this stack. Assumption for this assignment: the corpus is print-quality EN/AR PDFs.
+- **Handwriting and complex graphics are not reliably extracted, and OCR quality is not detected at ingest.** PaddleOCR-VL is a print/document OCR model. On handwritten classroom notes, dense diagrams, figure-heavy pages, or diacritic-heavy scanned books it does not fail cleanly — it returns plausible-looking but partly inaccurate text (observed on a scanned Arabic textbook: thematic questions answer correctly from the OCR'd body, but words mangle under heavy tashkeel and pinpoint facts buried in exercise drills can be missed). The ingest gate is now boilerplate-aware (a repeated per-page footer no longer masks an un-OCR'd image body — this was a real bug, fixed), but it is still fundamentally quantitative (`real_len(text) >= OCR_MIN_CHARS_PER_PAGE`): a *garbled but lengthy* OCR result passes the threshold, gets embedded, and silently degrades retrieval for that document. There is currently **no OCR-quality/confidence signal** surfaced to the user on load. Mitigations (not yet implemented): a per-page confidence gate combining a VL self-report (`[[UNREADABLE]]` sentinel) with a heuristic textiness score, an `ocr_confidence` payload field, default exclusion of low-confidence pages, and an explicit `rag-ingest` summary line (e.g. "4 pages flagged handwritten/unreadable and excluded"). Truly reading handwriting would require a handwriting-specialised model or a larger VLM — out of scope for this stack. Assumption for this assignment: the corpus is print-quality EN/AR PDFs.
 - Per-tenant collection routing. Only one collection today.
 - Old chunks for deleted/renamed PDFs are not pruned (re-upload with the same name overwrites in place; rename or delete needs a `client.delete(filter=...)`).
 - Baidu's PaddleOCR-VL image is large (~10 GB) and pulled from `ccr-2vdh3abv-pub.cnc.bj.baidubce.com`. The inline alternative in [docker-compose.yml](docker-compose.yml) (stock `vllm/vllm-openai:v0.11.1+`) is a drop-in if that registry is blocked.

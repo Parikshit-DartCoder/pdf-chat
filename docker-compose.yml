@@ -76,6 +76,9 @@ services:
     volumes:
       - hf_cache:/root/.cache/huggingface
       - paddle_cache:/root/.paddlex
+      # PaddleX reads --backend_config as a YAML FILE PATH, not an inline
+      # string. Mount the file read-only and point the flag at it.
+      - ./docker/paddleocr_backend.yaml:/etc/paddleocr_backend.yaml:ro
     command:
       - "paddleocr"
       - "genai_server"
@@ -88,7 +91,7 @@ services:
       - "--backend"
       - "vllm"
       - "--backend_config"
-      - "gpu-memory-utilization: 0.6"
+      - "/etc/paddleocr_backend.yaml"
     environment:
       NVIDIA_VISIBLE_DEVICES: "${PADDLEOCR_GPU:-0}"
       CUDA_VISIBLE_DEVICES: "0"   # always index 0 inside the container
