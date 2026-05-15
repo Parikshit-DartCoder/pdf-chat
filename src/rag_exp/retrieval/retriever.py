@@ -141,16 +141,11 @@ def rerank(
     s = get_settings()
     top_n = top_n or s.rerank_top_n
 
-    # bge-reranker-v2-m3 supports a task prompt that nudges the cross-encoder
-    # toward retrieval-style scoring; gives a small but free quality lift.
+    # NOTE: plain bge-reranker-v2-m3 (FlagReranker) does NOT accept a `prompt`
+    # kwarg -- it raises TypeError (that's an instruction-tuned / LLM-reranker
+    # feature). So we never pass it.
     pairs = [(query, c.text) for c in chunks]
-    reranker = _reranker()
-    try:
-        scores = reranker.compute_score(pairs, normalize=True, prompt=s.rerank_instruction)
-    except TypeError:
-        # Older FlagEmbedding versions don't support `prompt`; fall back.
-        scores = reranker.compute_score(pairs, normalize=True)
-
+    scores = _reranker().compute_score(pairs, normalize=True)
     if isinstance(scores, float):
         scores = [scores]
 
@@ -169,11 +164,13 @@ def rerank(
     above_floor = [c for c in rescored if c.score >= s.rerank_score_floor]
     if len(above_floor) >= s.rerank_min_chunks:
         return above_floor[:top_n]
-    # Floor would starve the answerer on this query (common for vague prompts
-    # like "what is this doc about"). Bypass the floor and return the
-    # highest-scored chunks instead -- better to ground on a weak match than
-    # to answer from no context at all.
-    return rescored[:top_n]
+
+    # Too few chunks cleared the floor -> the cross-encoder is unreliable for
+    # this query (typical for vague, contentless prompts like "what is this doc
+    # about?"). The upstream hybrid/dense retrieval DID carry signal, so fall
+    # back to the original retrieval order + scores rather than surfacing a
+    # mix of one weak score and several misleading ~0.000 reranker scores.
+    return list(chunks[:top_n])
 
 
 def retrieve(query: str, source_paths: list[str] | None = None) -> list[RetrievedChunk]:

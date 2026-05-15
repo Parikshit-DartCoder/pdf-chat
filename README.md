@@ -234,7 +234,9 @@ Each user turn runs four steps inside the agent:
 1. **Encode** the query into a dense BGE-M3 vector AND a BM25 sparse vector (hash-tokenized, see [retrieval/bm25.py](src/rag_exp/retrieval/bm25.py)).
 2. **Hybrid prefetch in Qdrant** -- two prefetches against the same collection (one per vector field), each returning the top `SPARSE_PREFETCH_K`/`DENSE_PREFETCH_K` candidates. Qdrant fuses them server-side with **Reciprocal Rank Fusion** (`Fusion.RRF`) and returns `TOP_K` unified candidates.
 3. **Cross-encoder rerank** with `bge-reranker-v2-m3`, called with a task-instruction prompt so the cross-encoder scores in retrieval mode.
-4. **Score floor with safety net** -- chunks below `RERANK_SCORE_FLOOR` (default 0.10 on normalized scores) are dropped so we never cite near-zero matches. But if fewer than `RERANK_MIN_CHUNKS` (default 3) chunks clear the floor (common for vague queries like *"what is this doc about"*), the floor is bypassed and the top-N highest-scored chunks are returned anyway. Better to ground on a weak match than to answer from no context. Top-N (default 7) returned.
+4. **Score floor + reranker-collapse fallback** -- chunks below `RERANK_SCORE_FLOOR` (default 0.10) are dropped. If fewer than `RERANK_MIN_CHUNKS` (default 3) clear the floor, the cross-encoder is deemed unreliable for this query (typical for vague, contentless prompts like *"what is this doc about?"* — a cross-encoder has no signal to rank them and collapses every score toward 0). Instead of surfacing misleading ~0.000 reranker scores, the system **falls back to the upstream hybrid/dense retrieval order and scores**, which *do* carry signal. So vague queries still get a grounded answer with meaningful citation scores. Top-N (default 7) returned.
+
+   The query rewriter also resolves "this doc / this paper / it" to the in-scope document name(s) from the session, turning a contentless query into a content-bearing one before retrieval even runs.
 
 ### Tunable hyperparameters
 

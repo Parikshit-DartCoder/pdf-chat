@@ -100,6 +100,13 @@ def make_load_memory(memory: MemoryBackend | None = None) -> Node:
             session_docs = list(backend.list_session_documents(sid))
             if session_docs:
                 state["source_paths"] = session_docs
+        # Human-readable document names for the query rewriter to resolve
+        # "this doc / this paper" into a content-bearing query.
+        from pathlib import Path as _P
+        state["document_names"] = [
+            _P(p).stem.replace("-", " ").replace("_", " ")
+            for p in (state.get("source_paths") or [])
+        ]
         return state
 
     return node
@@ -136,10 +143,13 @@ def make_rewrite_query(
     prompt_name: str = "query_rewriter",
 ) -> Node:
     def node(state: dict) -> dict:
+        names = state.get("document_names") or []
+        documents = "\n".join(f"- {n}" for n in names) if names else "(none specified)"
         prompt = _default_prompt_render(
             prompt_name,
             summary=state.get("summary", ""),
             question=state["question"],
+            documents=documents,
         )
         rewritten = _invoke(llm_factory(), prompt)
         state["search_query"] = rewritten or state["question"]

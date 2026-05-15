@@ -49,6 +49,7 @@ class AgentState(TypedDict, total=False):
     route: str            # "retrieve" | "chitchat" | "clarify" | <custom>
     search_query: str
     source_paths: list[str]   # if non-empty, retrieval is scoped to these docs
+    document_names: list[str]  # human-readable doc names for query rewriting
     retrieved: list[RetrievedChunk]
     answer: str
     citations: list[dict]
