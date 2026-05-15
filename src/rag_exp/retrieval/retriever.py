@@ -123,7 +123,8 @@ def dense_search(
         query=dense_vec,
         using=DENSE_VECTOR_NAME,
         limit=k,
-        filter=_build_filter(source_paths),
+        # qdrant-client 1.12: top-level kwarg is `query_filter` (Prefetch uses `filter`).
+        query_filter=_build_filter(source_paths),
         with_payload=True,
     )
     return [_payload_to_chunk(p.payload or {}, p.score) for p in res.points]

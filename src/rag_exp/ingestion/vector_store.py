@@ -97,20 +97,47 @@ def _chunk_id(chunk: Chunk) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
 
 
+def _is_embeddable(text: str) -> bool:
+    """Reject degenerate text that makes the embedding model emit NaN:
+    empty/whitespace, too-short, or no alphanumeric/Arabic content."""
+    t = (text or "").strip()
+    if len(t) < 10:
+        return False
+    import re
+    return bool(re.search(r"[0-9A-Za-z؀-ۿ]", t))
+
+
+def _embed_one(embedder, text: str):
+    """Embed a single text; return the vector or None if the model/server
+    chokes (Ollama returns HTTP 500 'unsupported value: NaN' on bad input)."""
+    try:
+        return embedder.embed_documents([text])[0]
+    except Exception:
+        return None
+
+
 def upsert_chunks(chunks: Iterable[Chunk], batch_size: int | None = None) -> int:
     s = get_settings()
     batch_size = batch_size or s.embed_batch
     client = ensure_collection()
     embedder = build_embedder()
 
-    chunks = list(chunks)
+    # Drop degenerate chunks up front so one bad page can't poison a batch.
+    chunks = [c for c in chunks if _is_embeddable(c.text)]
     written = 0
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i : i + batch_size]
-        dense_vectors = embedder.embed_documents([c.text for c in batch])
+        try:
+            dense_vectors = embedder.embed_documents([c.text for c in batch])
+        except Exception:
+            # A single chunk in the batch made the embedder 500. Fall back to
+            # per-chunk embedding and skip only the offending ones.
+            dense_vectors = [_embed_one(embedder, c.text) for c in batch]
 
         points = []
         for c, dv in zip(batch, dense_vectors):
+            if dv is None:
+                continue  # unembeddable chunk -- skip, keep the rest
             indices, values = bm25.encode(c.text)
             points.append(
                 qmodels.PointStruct(
@@ -131,6 +158,7 @@ def upsert_chunks(chunks: Iterable[Chunk], batch_size: int | None = None) -> int
                 )
             )
 
-        client.upsert(collection_name=s.qdrant_collection, points=points)
-        written += len(points)
+        if points:
+            client.upsert(collection_name=s.qdrant_collection, points=points)
+            written += len(points)
     return written

@@ -27,8 +27,10 @@ rerank_min_chunks = 3
 rerank_instruction = "Given a question, retrieve passages that contain the answer."
 
 [chunking]
-chunk_size = 1200
-chunk_overlap = 150
+# Smaller chunks + boilerplate stripping + semantic (Article/clause) splitting
+# keep each chunk topically tight, which lifts retrieval precision.
+chunk_size = 600
+chunk_overlap = 100
 
 [ingestion]
 # Vectors per Ollama embedding HTTP request. Bigger = fewer round-trips.

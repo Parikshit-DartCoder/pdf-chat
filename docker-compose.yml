@@ -7,7 +7,7 @@ x-app-env: &app_env
   LANGFUSE_HOST: http://langfuse:3000
   LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-rag-exp-local}
   LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-rag-exp-local}
-  LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+  LLM_MODEL: ${LLM_MODEL:-qwen3.5:9b}
   EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
   EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
   PADDLEOCR_VL_URL: http://paddleocr-vl:8118/v1
@@ -24,7 +24,7 @@ services:
       - qdrant_data:/qdrant/storage
 
   ollama:
-    image: ollama/ollama:0.4.7
+    image: ollama/ollama:latest
     restart: unless-stopped
     ports:
       - "11435:11434"   # host:container — host's own Ollama owns 11434
@@ -101,14 +101,14 @@ services:
               capabilities: [gpu]
 
   ollama-bootstrap:
-    image: ollama/ollama:0.4.7
+    image: ollama/ollama:latest
     depends_on:
       - ollama
     entrypoint: ["/bin/sh", "-c"]
     command: >
       "until ollama list >/dev/null 2>&1; do sleep 2; done;
-       ollama pull qwen2.5:7b-instruct &&
-       ollama pull bge-m3"
+       ollama pull ${LLM_MODEL:-qwen3.5:9b} &&
+       ollama pull ${EMBEDDING_MODEL:-bge-m3}"
     environment:
       OLLAMA_HOST: "http://ollama:11434"
     restart: "no"

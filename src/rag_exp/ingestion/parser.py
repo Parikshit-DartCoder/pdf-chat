@@ -98,49 +98,56 @@ def _pdf_page_count(pdf_path: Path) -> int:
         pdf.close()
 
 
-def _ocr_page_with_paddle(pdf_path: Path, page_number: int) -> ParsedPage | None:
-    """Rasterize one page and OCR it. Returns None on failure so callers can skip."""
-    from .paddleocr_vl_client import ocr_page, rasterize_pdf_page
-
-    try:
-        png = rasterize_pdf_page(str(pdf_path), page_number)
-        result = ocr_page(png, page_number=page_number, task="OCR")
-    except Exception:
-        return None
-
-    if not result.text.strip():
-        return None
-
-    return ParsedPage(
-        source_path=str(pdf_path),
-        page_number=page_number,
-        text=result.text,
-        extractor="paddleocr-vl",
-    )
-
-
 def _ocr_pages_parallel(pdf_path: Path, page_numbers: list[int], max_workers: int) -> dict[int, ParsedPage]:
-    """OCR multiple pages concurrently via a thread pool. PaddleOCR-VL is
-    HTTP-bound from our side, so threads are sufficient and avoid asyncio
-    complexity."""
+    """OCR multiple pages, fast AND safe.
+
+    pypdfium2 is NOT thread-safe -- opening PdfDocument from worker threads
+    corrupts pdfium's global state and makes subsequent PDFs fail to load
+    ("Data format error") even though they're valid. So:
+      Phase 1: rasterize every needed page SEQUENTIALLY (single-threaded pdfium).
+      Phase 2: send the page images to PaddleOCR-VL CONCURRENTLY (HTTP is the
+               slow part and is thread-safe).
+    """
     if not page_numbers:
         return {}
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    from .paddleocr_vl_client import ocr_page, rasterize_pdf_page
+
+    # Phase 1: single-threaded rasterization.
+    rasterized: dict[int, bytes] = {}
+    for pn in page_numbers:
+        try:
+            rasterized[pn] = rasterize_pdf_page(str(pdf_path), pn)
+        except Exception:
+            continue
+
+    # Phase 2: concurrent OCR over the in-memory PNGs (no pdfium in threads).
+    def _ocr(pn: int, png: bytes) -> ParsedPage | None:
+        try:
+            result = ocr_page(png, page_number=pn, task="OCR")
+        except Exception:
+            return None
+        if not result.text.strip():
+            return None
+        return ParsedPage(
+            source_path=str(pdf_path),
+            page_number=pn,
+            text=result.text,
+            extractor="paddleocr-vl",
+        )
+
     results: dict[int, ParsedPage] = {}
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
-        futures = {
-            pool.submit(_ocr_page_with_paddle, pdf_path, pn): pn
-            for pn in page_numbers
-        }
+        futures = {pool.submit(_ocr, pn, png): pn for pn, png in rasterized.items()}
         for fut in as_completed(futures):
-            pn = futures[fut]
+            page = None
             try:
                 page = fut.result()
             except Exception:
                 page = None
             if page is not None:
-                results[pn] = page
+                results[page.page_number] = page
     return results
 
 

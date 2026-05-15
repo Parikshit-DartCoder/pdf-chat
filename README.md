@@ -10,7 +10,7 @@ The Python package is `rag_exp` (internal); the product is **PDF Chat**.
 | --- | --- | --- |
 | PDF text and layout | **Docling** (OCR disabled, pypdf fallback) | Fast layout and table-aware extraction for text-native PDFs. |
 | OCR | **PaddleOCR-VL-1.5** served by **vLLM** | 0.9B VL OCR model. Strong on Arabic incl. diacritics and ligatures. GPU-batched, OpenAI-compatible API. Replaced EasyOCR. |
-| Chunking | RecursiveCharacterTextSplitter with EN+AR separators | Preserves semantic boundaries in both scripts. |
+| Chunking | Boilerplate-stripped + semantic (Article/clause) + recursive char fallback, EN+AR | Removes PDF page furniture (headers, page numbers, rule lines) and splits on Article/clause boundaries so each chunk is topically tight. Lifted context precision from a 0.47 ceiling to 0.60. |
 | Embeddings | **BGE-M3** via Ollama (1024-dim) | Strong multilingual model, covers EN and AR with a single index. |
 | Vector DB | **Qdrant** | One container, server-side BM25 sparse vectors (IDF modifier), payload indexes. |
 | Retrieval | **Hybrid (dense + BM25) with RRF fusion** | Catches both semantic and exact-term hits. BM25 implemented as a hash-tokenized sparse vector with `Modifier.IDF`. |
@@ -276,10 +276,11 @@ The collection schema went from a single anonymous dense vector to a named `{den
 
 ## OCR strategy
 
-Each PDF page is parsed in two phases:
+Each PDF page is parsed in phases:
 
-1. **Docling (OCR off)** extracts embedded text and layout for the whole PDF. Tables keep their structure.
-2. **PaddleOCR-VL** is invoked per page when Docling returned nothing or fewer than `OCR_MIN_CHARS_PER_PAGE` characters (default 40). The page is rasterized via pypdfium2 at 200 DPI, sent to vLLM with the `OCR:` prompt, and the model returns markdown.
+1. **pypdf** fast text pass; **Docling** runs only when pypdf is sparse (layout/table-aware).
+2. **PaddleOCR-VL** per page when text is still under `OCR_MIN_CHARS_PER_PAGE` (default 40). Pages are rasterized via pypdfium2 at 200 DPI **single-threaded** (pypdfium2 is not thread-safe — concurrent access corrupts its global state and breaks later PDFs), then OCR'd **concurrently** over the in-memory PNGs (the HTTP call is the slow, thread-safe part).
+3. **Resilient embedding**: degenerate chunks (empty / whitespace / non-text) are dropped before embedding, and a batch that makes Ollama emit `NaN` falls back to per-chunk embedding so one bad page can't skip a whole document.
 
 Text-native PDFs cost no GPU OCR cycles. Scanned PDFs get a state-of-the-art Arabic-capable VL OCR. Force OCR everywhere with `OCR_MIN_CHARS_PER_PAGE=999999`.
 
@@ -289,11 +290,28 @@ Other task prompts available via [paddleocr_vl_client.ocr_page](src/rag_exp/inge
 
 ```bash
 # Edit data/eval_cases.jsonl with {"question": "...", "ground_truth": "..."} per line.
-sudo docker compose exec api rag-evaluate /app/data/eval_cases.jsonl
+# Use bash -lc (or -it) so rich-formatted output isn't swallowed by non-TTY exec:
+sudo docker compose exec api bash -lc "rag-evaluate /app/data/eval_cases.jsonl"
 # Scores print and are written to data/eval_results.json.
 ```
 
 Metrics: faithfulness, answer relevancy, context precision, context recall. Judge LLM and embeddings come from the same Ollama instance.
+
+### Latest measured results
+
+On the bundled 6-case EN/AR UDHR eval set (`data/eval_cases.jsonl`), Qwen 2.5 7B agent + judge, hybrid retrieval, semantic chunking:
+
+| Metric | Score |
+| --- | --- |
+| faithfulness | ~0.72 |
+| answer_relevancy | ~0.84 |
+| context_precision | ~0.60 |
+| context_recall | ~0.70 |
+
+Notes:
+- Scores carry ±0.10 run-to-run jitter on N=6 (RAGAs LLM-judge is non-deterministic on Ollama). Expand the eval set to ~25 cases for stable numbers.
+- `context_precision` was pinned at ~0.47 by PDF boilerplate in chunks; the semantic/cleaned chunker broke that ceiling to ~0.60. It's the structural lever for this metric — no retrieval knob (top_k, floor, top_n) moved it.
+- Precision ↔ recall trade by design; tune `rerank_top_n` / `rerank_score_floor` in `configs/retrieval.toml` to shift the balance for your corpus.
 
 ## Applying changes after edits
 

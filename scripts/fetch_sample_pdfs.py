@@ -28,17 +28,27 @@ SAMPLES: list[tuple[str, str]] = [
 
 
 def _is_valid_pdf(path: Path) -> bool:
-    """Cheap-but-effective PDF sanity check: header magic and EOF marker.
-    Catches truncated downloads and HTML-as-PDF mistakes."""
+    """Strict check: header magic, EOF marker, AND it must actually open with
+    the same library ingestion uses (pypdfium2). A header/EOF-only check passes
+    files that are structurally broken mid-body."""
     if not path.exists() or path.stat().st_size < 1024:
         return False
     with path.open("rb") as f:
-        head = f.read(8)
-        if not head.startswith(b"%PDF-"):
+        if not f.read(8).startswith(b"%PDF-"):
             return False
-        f.seek(-1024, 2)   # last 1 KB
-        tail = f.read()
-        return b"%%EOF" in tail
+        f.seek(-1024, 2)
+        if b"%%EOF" not in f.read():
+            return False
+    try:
+        import pypdfium2 as pdfium
+
+        doc = pdfium.PdfDocument(str(path))
+        try:
+            return len(doc) > 0
+        finally:
+            doc.close()
+    except Exception:
+        return False
 
 
 def download(url: str, dest: Path) -> int:
